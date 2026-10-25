@@ -38,6 +38,7 @@ class NetherNetDiscovery {
 
   final Map<int, InternetAddress> _peers = {};
   final Map<int, int> _peerPorts = {};
+  final Set<String> _localAddresses = {};
 
   void Function(int senderId, InternetAddress address)? onPeerSeen;
   void Function(InternetAddress address, int port, int requestCount)?
@@ -87,6 +88,7 @@ class NetherNetDiscovery {
     if (_outboundSocket != null) return true;
     _stopped = false;
     try {
+      await _refreshLocalAddresses();
       final outbound = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       outbound.broadcastEnabled = true;
       _outboundSocket = outbound;
@@ -131,7 +133,7 @@ class NetherNetDiscovery {
         reuseAddress: true,
         reusePort: Platform.isIOS || Platform.isMacOS,
       );
-          if (_stopped || _socket != null) {
+      if (_stopped || _socket != null) {
         socket.close();
         return _socket != null;
       }
@@ -211,6 +213,7 @@ class NetherNetDiscovery {
     _outboundSocket = null;
     _peers.clear();
     _peerPorts.clear();
+    _localAddresses.clear();
     _requestCounts.clear();
     logger.info('NetherNet discovery stopped');
   }
@@ -331,7 +334,7 @@ class NetherNetDiscovery {
     final port = _peerPorts[recipientId];
     if (address == null || port == null) return false;
 
-    if (port == NetherNetProtocol.discoveryPort) {
+    if (port == NetherNetProtocol.discoveryPort && _isSameDevice(address)) {
       _releaseDiscoverySocketTemporarily();
     }
 
@@ -376,11 +379,28 @@ class NetherNetDiscovery {
     'veth',
   ];
 
+  bool _isSameDevice(InternetAddress address) =>
+      address.isLoopback || _localAddresses.contains(address.address);
+
+  Future<void> _refreshLocalAddresses() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+      );
+      _localAddresses
+        ..clear()
+        ..addAll(interfaces.expand((i) => i.addresses).map((a) => a.address));
+    } catch (_) {}
+  }
+
   Future<List<InternetAddress>> _directedBroadcastAddresses() async {
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
       );
+      _localAddresses
+        ..clear()
+        ..addAll(interfaces.expand((i) => i.addresses).map((a) => a.address));
       final result = <InternetAddress>[];
       for (final interface in interfaces) {
         final name = interface.name.toLowerCase();
