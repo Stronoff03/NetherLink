@@ -162,8 +162,11 @@ class NetherNetDiscovery {
     _subscription = null;
     if (sub != null) unawaited(sub.cancel());
     socket?.close();
-    _rebindTimer = Timer(const Duration(seconds: 5), () {
-      if (!_stopped) unawaited(_bindDiscoverySocket());
+    _rebindTimer = Timer(const Duration(seconds: 5), () async {
+      if (_stopped) return;
+      if (!await _bindDiscoverySocket() && !_stopped) {
+        _releaseDiscoverySocketTemporarily();
+      }
     });
   }
 
