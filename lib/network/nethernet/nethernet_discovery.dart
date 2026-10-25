@@ -26,6 +26,9 @@ class NetherNetSignal {
 class NetherNetDiscovery {
   RawDatagramSocket? _socket;
   StreamSubscription<RawSocketEvent>? _subscription;
+  RawDatagramSocket? _outboundSocket;
+  StreamSubscription<RawSocketEvent>? _outboundSubscription;
+  Timer? _rebindTimer;
 
   final Logger logger;
   final int networkId;
@@ -51,7 +54,7 @@ class NetherNetDiscovery {
     return (rng.nextInt(0xFFFFFFFF) << 32) | rng.nextInt(0xFFFFFFFF);
   }
 
-  bool get running => _socket != null;
+  bool get running => _outboundSocket != null || _socket != null;
 
   Map<int, InternetAddress> get peers => Map.unmodifiable(_peers);
 
@@ -81,8 +84,46 @@ class NetherNetDiscovery {
   bool _recovering = false;
 
   Future<bool> start() async {
-    if (_socket != null) return true;
+    if (_outboundSocket != null) return true;
     _stopped = false;
+    try {
+      final outbound = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      outbound.broadcastEnabled = true;
+      _outboundSocket = outbound;
+      if (!_recovering) _blockedReported = false;
+      _outboundSubscription = outbound.listen(
+        (event) => _onEvent(outbound, event),
+        onError: (Object e) {
+          if (_isLocalNetworkBlocked(e)) {
+            _reportBlocked(e);
+          } else {
+            logger.error('NetherNet outbound socket error: $e');
+          }
+          _recover();
+        },
+        onDone: _recover,
+      );
+
+      final boundDiscovery = await _bindDiscoverySocket();
+      if (!boundDiscovery) {
+        await stop();
+        return false;
+      }
+
+      logger.info(
+        'NetherNet discovery listening on ${NetherNetProtocol.discoveryPort} '
+        '(outbound ${outbound.port}, networkId ${networkId.toUnsigned(64)})',
+      );
+      return true;
+    } catch (e, st) {
+      logger.error('NetherNet discovery could not bind: $e\n$st');
+      await stop();
+      return false;
+    }
+  }
+
+  Future<bool> _bindDiscoverySocket() async {
+    if (_stopped || _socket != null) return _socket != null;
     try {
       final socket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
@@ -92,9 +133,8 @@ class NetherNetDiscovery {
       );
       socket.broadcastEnabled = true;
       _socket = socket;
-      if (!_recovering) _blockedReported = false;
       _subscription = socket.listen(
-        _onEvent,
+        (event) => _onEvent(socket, event),
         onError: (Object e) {
           if (_isLocalNetworkBlocked(e)) {
             _reportBlocked(e);
@@ -103,27 +143,44 @@ class NetherNetDiscovery {
           }
           _recover();
         },
-        onDone: _recover,
-      );
-      logger.info(
-        'NetherNet discovery listening on ${NetherNetProtocol.discoveryPort} '
-        '(networkId ${networkId.toUnsigned(64)})',
+        onDone: () {
+          if (_socket == socket) _recover();
+        },
       );
       return true;
     } catch (e, st) {
-      logger.error('NetherNet discovery could not bind: $e\n$st');
+      logger.error('NetherNet discovery could not bind port 7551: $e\n$st');
       return false;
     }
+  }
+
+  void _releaseDiscoverySocketTemporarily() {
+    _rebindTimer?.cancel();
+    final socket = _socket;
+    final sub = _subscription;
+    _socket = null;
+    _subscription = null;
+    if (sub != null) unawaited(sub.cancel());
+    socket?.close();
+    _rebindTimer = Timer(const Duration(seconds: 5), () {
+      if (!_stopped) unawaited(_bindDiscoverySocket());
+    });
   }
 
   Future<void> _recover() async {
     if (_stopped || _recovering) return;
     _recovering = true;
     try {
+      _rebindTimer?.cancel();
+      _rebindTimer = null;
       await _subscription?.cancel();
       _subscription = null;
       _socket?.close();
       _socket = null;
+      await _outboundSubscription?.cancel();
+      _outboundSubscription = null;
+      _outboundSocket?.close();
+      _outboundSocket = null;
       await Future<void>.delayed(const Duration(milliseconds: 500));
       if (!_stopped && await start()) {
         logger.info('NetherNet discovery socket restarted');
@@ -135,20 +192,24 @@ class NetherNetDiscovery {
 
   Future<void> stop() async {
     _stopped = true;
+    _rebindTimer?.cancel();
+    _rebindTimer = null;
     await _subscription?.cancel();
     _subscription = null;
     _socket?.close();
     _socket = null;
+    await _outboundSubscription?.cancel();
+    _outboundSubscription = null;
+    _outboundSocket?.close();
+    _outboundSocket = null;
     _peers.clear();
     _peerPorts.clear();
     _requestCounts.clear();
     logger.info('NetherNet discovery stopped');
   }
 
-  void _onEvent(RawSocketEvent event) {
+  void _onEvent(RawDatagramSocket socket, RawSocketEvent event) {
     if (event != RawSocketEvent.read) return;
-    final socket = _socket;
-    if (socket == null) return;
 
     final datagram = socket.receive();
     if (datagram == null) return;
@@ -162,7 +223,7 @@ class NetherNetDiscovery {
     final packetId = view.getUint16(0, Endian.little);
     final senderId = view.getUint64(2, Endian.little);
 
-    if (senderId == networkId) return;
+    if (senderId == networkId || senderId == 0) return;
 
     final isNewPeer = !_peers.containsKey(senderId);
     _peers[senderId] = datagram.address;
@@ -223,7 +284,7 @@ class NetherNetDiscovery {
     }
 
     final message = utf8.decode(
-      Uint8List.sublistView(body, 30),
+      Uint8List.sublistView(body, 30, 30 + declared),
       allowMalformed: true,
     );
     if (message == 'Ping') return;
@@ -262,6 +323,10 @@ class NetherNetDiscovery {
     final address = _peers[recipientId];
     final port = _peerPorts[recipientId];
     if (address == null || port == null) return false;
+
+    if (port == NetherNetProtocol.discoveryPort) {
+      _releaseDiscoverySocketTemporarily();
+    }
 
     final message = payload.isEmpty
         ? '$type ${NetherNetProtocol.unsignedString(connectionId)}'
@@ -330,7 +395,7 @@ class NetherNetDiscovery {
   }
 
   bool _send(Uint8List body, InternetAddress address, int port) {
-    final socket = _socket;
+    final socket = _outboundSocket ?? _socket;
     if (socket == null) return false;
     try {
       final sent = socket.send(
