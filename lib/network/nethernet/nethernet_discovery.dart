@@ -131,6 +131,10 @@ class NetherNetDiscovery {
         reuseAddress: true,
         reusePort: Platform.isIOS || Platform.isMacOS,
       );
+          if (_stopped || _socket != null) {
+        socket.close();
+        return _socket != null;
+      }
       socket.broadcastEnabled = true;
       _socket = socket;
       _subscription = socket.listen(
